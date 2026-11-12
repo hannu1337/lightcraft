@@ -110,8 +110,11 @@ pub(super) fn proxies(
         return None;
     }
     let matches = |w: usize, h: usize, rw: usize, rh: usize| (rw as f64 / rh as f64 / (w as f64 / h as f64) - 1.0).abs() <= 0.02;
-    if !matches(crop.width, crop.height, reference.width, reference.height) {
-        // Panasonic previews show the whole active area while the default crop is the in-camera aspect ratio
+    // Panasonic previews always show the whole active area, while the default crop is the in-camera aspect ratio or a
+    // smaller frame of the sensor's own aspect (DC-S9: centred 3:2 frames down to half the width): an aspect that
+    // matches doesn't mean the preview shows the crop
+    let whole_sensor_preview = raw.format == RawFormat::Rw2 && matches(a.width, a.height, reference.width, reference.height);
+    if whole_sensor_preview || !matches(crop.width, crop.height, reference.width, reference.height) {
         if !matches(a.width, a.height, reference.width, reference.height) {
             return None;
         }

@@ -1125,6 +1125,81 @@ fn corpus_rw2_with_an_in_camera_crop_gets_a_camera_look() {
     assert!(info.relative_wb && info.as_shot_temp == 6500.0 && info.as_shot_tint == 0.0);
 }
 
+/// A synthetic 14-bit RW2 (raw format 7) of a non-periodic grey scene, `w` × `h` with no borders, default crop
+/// `crop` (top, left, bottom, right) and an embedded JPEG (`0x002e`) of the whole sensor at half size, as Panasonic
+/// writes it.
+fn synthetic_rw2_with_whole_sensor_jpeg(w: u16, h: u16, crop: [u16; 4]) -> Vec<u8> {
+    use craft_tiff::{ByteOrder, IfdBuilder, TiffWriter, Value};
+    // value noise on 24 px cells: structure at the proxy's scale that a shifted or rescaled copy doesn't share
+    let hash =
+        |cx: i64, cy: i64| ((cx.wrapping_mul(73_856_093) ^ cy.wrapping_mul(19_349_663)).wrapping_mul(2_654_435_761) >> 8 & 0xffff) as f32 / 65535.0;
+    let scene = |x: f32, y: f32| {
+        let (cx, cy) = (x / 24.0, y / 24.0);
+        let (ix, iy, fx, fy) = (cx.floor() as i64, cy.floor() as i64, cx.fract(), cy.fract());
+        let top = hash(ix, iy) * (1.0 - fx) + hash(ix + 1, iy) * fx;
+        let bottom = hash(ix, iy + 1) * (1.0 - fx) + hash(ix + 1, iy + 1) * fx;
+        0.03 + 0.6 * (top * (1.0 - fy) + bottom * fy)
+    };
+    let (wu, hu) = (w as usize, h as usize);
+    // RGGB samples, black 512, as-shot multipliers 2 / 1 / 1.5 (WB levels 512, 256, 384): grey after white balance
+    let gain = [0.5, 1.0, 1.0 / 1.5];
+    let samples: Vec<u16> = (0..wu * hu)
+        .map(|i| {
+            let (x, y) = (i % wu, i / wu);
+            let c = (y % 2) + (x % 2);
+            (512.0 + scene(x as f32, y as f32) * gain[c] * 15000.0) as u16
+        })
+        .collect();
+    let payload: Vec<u8> =
+        samples.chunks(9).flat_map(|blk| blk.iter().enumerate().fold(0u128, |a, (i, &v)| a | (v as u128) << (i as u32 * 14)).to_le_bytes()).collect();
+    let (jw, jh) = (wu / 2, hu / 2);
+    let pixels: Vec<u8> = (0..jw * jh)
+        .flat_map(|i| {
+            let v = scene((i % jw) as f32 * 2.0 + 1.0, (i / jw) as f32 * 2.0 + 1.0);
+            [lightcraft_color::transfer::linear_to_srgb(v).mul_add(255.0, 0.5) as u8; 3]
+        })
+        .collect();
+    let image = lightcraft_codecs::EncodeImage::new(jw as u32, jh as u32, 3, lightcraft_codecs::Samples::U8(&pixels));
+    let jpeg = lightcraft_codecs::encode_jpeg(&image, 95, lightcraft_codecs::ChromaSubsampling::S444, &Default::default()).unwrap();
+    let build = |offset: u32| {
+        let mut ifd = IfdBuilder::new();
+        let shorts = [(0x0002, w), (0x0003, h), (0x0004, 0), (0x0005, 0), (0x0006, h), (0x0007, w), (0x0009, 1), (0x000a, 14), (0x002d, 7)];
+        let levels = [(0x001c, 512), (0x001d, 512), (0x001e, 512), (0x0024, 512), (0x0025, 256), (0x0026, 384)];
+        let framing = [(0x002f, crop[0]), (0x0030, crop[1]), (0x0031, crop[2]), (0x0032, crop[3])];
+        for (tag, v) in shorts.into_iter().chain(levels).chain(framing) {
+            ifd.set(tag, Value::Short(vec![v]));
+        }
+        ifd.set(0x010f, Value::Ascii("Panasonic".into()));
+        ifd.set(0x002e, Value::Undefined(jpeg.clone()));
+        ifd.set(0x0118, Value::Long(vec![offset]));
+        let mut b = TiffWriter::new(ByteOrder::Little, false).write(&[ifd]).unwrap();
+        b[2] = 0x55; // "IIU"
+        b
+    };
+    let offset = build(0).len().div_ceil(16) * 16;
+    let mut bytes = build(offset as u32);
+    bytes.resize(offset, 0);
+    bytes.extend_from_slice(&payload);
+    bytes
+}
+
+/// A Panasonic default crop of the sensor's own aspect ratio but smaller (the DC-S9 records centred 3:2 frames from
+/// 3100 × 2066 to 6000 × 4000 on its 6000 × 4000 sensor) while its embedded JPEG shows the whole sensor: the fit pairs
+/// the crop with the matching part of the JPEG. It used to pair it with the whole JPEG, a different picture, and on
+/// one such file fitted a flat, green look.
+#[test]
+fn rw2_crop_of_the_sensors_aspect_pairs_with_the_matching_part_of_the_jpeg() {
+    for (crop, what) in [([256, 384, 768, 1152], "centred half"), ([0, 0, 1024, 1536], "whole sensor")] {
+        let bytes = synthetic_rw2_with_whole_sensor_jpeg(1536, 1024, crop);
+        let raw = lightcraft_raw::decode(&bytes).unwrap();
+        assert_eq!((raw.format, raw.crop.width, raw.crop.height), (RawFormat::Rw2, (crop[3] - crop[1]) as usize, (crop[2] - crop[0]) as usize));
+        let t = lightcraft_raw::color::camera_transform(&raw, lightcraft_raw::color::as_shot_white_xy(&raw));
+        let (sensor, reference, _) = proxies(&raw, &bytes, &t, PROXY, 0.0, None, None).expect("proxies");
+        let aligned = alignment(&sensor, &reference);
+        assert!(aligned > 0.8, "{what}: the sensor and the camera JPEG don't line up (alignment {aligned:.3})");
+    }
+}
+
 /// Issue #232 (skipped without the corpus): the public ILCE-7RM2 sample's camera JPEG is
 /// distortion-corrected, and on its glass façade the fit on all pixels misses the gate
 /// (held-out RMS 0.113): it used to open grey with the neutral fallback.
