@@ -71,7 +71,9 @@
 //! - The CFA pattern applies at sample (0, 0) of the data, not at the sensor borders [the two files with odd borders
 //!   show the greens on the diagonal this predicts]; red and blue were checked against every file's JPEG.
 //! - Active area: the sensor borders. Default crop: `0x002f`–`0x0032`, the in-camera aspect ratio (e.g. 4:3 or 1:1
-//!   on a 3:2 sensor; the embedded JPEG always shows the whole sensor). Some bodies write zeros there: ignored.
+//!   on a 3:2 sensor) or a smaller centred frame of the sensor's own aspect (DC-S9: 3:2 frames from 3100 × 2066 to
+//!   6000 × 4000 on its 6000 × 4000 sensor); the embedded JPEG always shows the whole sensor. Some bodies write zeros
+//!   there: ignored.
 //!
 //! Lens distortion (tag `0x0119`, ExifTool name DistortionInfo; ExifTool's names for its words were the only outside
 //! input, their meaning below is our own measurement). The tag holds 16 little-endian 16-bit words. The camera's
